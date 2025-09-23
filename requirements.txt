@@ -1,0 +1,8 @@
+dash
+dash-bootstrap-components
+plotly
+pandas
+numpy
+requests
+typer
+# додай інші бібліотеки, які вимагає твій live.py
