@@ -5,4 +5,7 @@ pandas
 numpy
 requests
 typer
-# додай інші бібліотеки, які вимагає твій live.py
+ccxt
+tenacity
+lightgbm
+scikit-learn
