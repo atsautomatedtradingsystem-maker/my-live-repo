@@ -1,0 +1,12 @@
+dash
+dash-bootstrap-components
+plotly
+pandas
+numpy
+requests
+typer
+ccxt
+torch
+tenacity
+lightgbm
+faiss-cpu  # optional, якщо хочете faiss (може бути важким для інсталяції)
