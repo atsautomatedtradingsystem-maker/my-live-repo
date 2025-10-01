@@ -1,5 +1,6 @@
-﻿# live.py — оновлений для живої симуляції (демо) з non-blocking AE та уніфікованими open/close
+# live.py — оновлений для живої симуляції (демо) з non-blocking AE та уніфікованими open/close
 import os
+from pathlib import Path
 
 
 # --- Trade notification helper ---
@@ -430,7 +431,7 @@ def train_calibrator_startup(min_samples=1, method='platt', persist_path='calibr
         # persist to disk for next restarts
         try:
             with open(persist_path, 'wb') as pf:
-                pickle.dump(cal, pf)
+                _pickle.dump(cal, pf)
         except Exception:
             try:
                 log.exception('Failed to persist calibrator to disk')
@@ -536,6 +537,10 @@ def schedule_retrain(df, wnd_min, model_name):
         try:
             if callable(train_autoencoder):
                 res = train_autoencoder(df, wnd_min, model_name)
+                try:
+                    last_retrain_ts = time.time()
+                except Exception:
+                    pass
                 if _asyncio_helper.iscoroutine(res):
                     await res
         except Exception as e:
@@ -973,6 +978,7 @@ def compute_aggregated_realized(store, fallback_realized=0.0):
 # ==================== 1. SETTINGS ====================
 class Settings:
     def __init__(self):
+
         # initial symbol (still can be changed by selector)
         self.symbol               = 'BTC/USDT'
         self.timeframes           = ['1h', '5m']
@@ -988,7 +994,9 @@ class Settings:
 
         # money / sizing
         self.base_usd             = 10000
-       
+        # account for expected slippage (0.1%)
+        self.slippage_pct         = 0.001
+
         # stops / trailing
         # slightly tighter stop by default (1.5%)
         self.stop_loss_pct        = 0.015
@@ -1058,6 +1066,10 @@ class Settings:
         # Dry-run (no real orders when True)
         self.dry_run = True
 
+        # minimal profit required before trailing activates (fraction)
+        self.min_profit_to_trail_pct = 0.001
+        # minimum seconds between full retrains (cooldown)
+        self.retrain_cooldown = 3600
 
 settings = Settings()
 
@@ -2456,15 +2468,57 @@ async def run_live():
                 try:
                     if wallet.get('position', 0.0) > 0:
                         init_stop = tr['price'] - local_stop_loss_atr_mult * atr
-                        tr['trail_base'] = max(tr.get('trail_base', tr['price']), price_now)
-                        trigger = tr['trail_base'] - settings.trailing_atr_mult * atr
-                        trailing_triggered = price_now <= trigger
+                        # maintain explicit high-water mark for trailing (only increases)
+                        tr['trail_high'] = max(tr.get('trail_high', tr['price']), price_now)
+                        # arm trailing only after a minimal profit threshold to avoid early noise
+                        try:
+                            armed = tr.get('trail_armed', False) or (price_now >= tr['price'] * (1.0 + float(getattr(settings, 'min_profit_to_trail_pct', 0.001))))
+                            tr['trail_armed'] = armed
+                        except Exception:
+                            tr['trail_armed'] = tr.get('trail_armed', False)
+                        # compute two triggers: ATR-based and percentage-based
+                        trigger_atr = tr['trail_high'] - settings.trailing_atr_mult * atr
+                        trigger_pct = tr['trail_high'] * (1.0 - settings.trailing_pct)
+                        # trailing triggers if either threshold is breached (more robust)
+                        trailing_triggered = False
+                        try:
+                            if tr.get('trail_armed', False):
+                                trailing_triggered = (price_now <= trigger_atr) or (price_now <= trigger_pct)
+                            else:
+                                trailing_triggered = False
+                        except Exception:
+                            trailing_triggered = False
+                        # debug logging for trailing diagnostics
+                        try:
+                            log.debug(f"TRAIL CHECK long: price_now={price_now:.6f}, trail_high={tr.get('trail_high')}, trigger_atr={trigger_atr:.6f}, trigger_pct={trigger_pct:.6f}, armed={tr.get('trail_armed')}, atr={atr:.6f}")
+                        except Exception:
+                            pass
                         stop_triggered = price_now <= init_stop
                     else:
                         init_stop = tr['price'] + local_stop_loss_atr_mult * atr
-                        tr['trail_base'] = min(tr.get('trail_base', tr['price']), price_now)
-                        trigger = tr['trail_base'] + settings.trailing_atr_mult * atr
-                        trailing_triggered = price_now >= trigger
+                        # maintain explicit low-water mark for trailing (only decreases)
+                        tr['trail_low'] = min(tr.get('trail_low', tr['price']), price_now)
+                        # arm trailing only after minimal profit threshold for shorts
+                        try:
+                            armed = tr.get('trail_armed', False) or (price_now <= tr['price'] * (1.0 - float(getattr(settings, 'min_profit_to_trail_pct', 0.001))))
+                            tr['trail_armed'] = armed
+                        except Exception:
+                            tr['trail_armed'] = tr.get('trail_armed', False)
+                        trigger_atr = tr['trail_low'] + settings.trailing_atr_mult * atr
+                        trigger_pct = tr['trail_low'] * (1.0 + settings.trailing_pct)
+                        trailing_triggered = False
+                        try:
+                            if tr.get('trail_armed', False):
+                                trailing_triggered = (price_now >= trigger_atr) or (price_now >= trigger_pct)
+                            else:
+                                trailing_triggered = False
+                        except Exception:
+                            trailing_triggered = False
+                        # debug logging for trailing diagnostics (short)
+                        try:
+                            log.debug(f"TRAIL CHECK short: price_now={price_now:.6f}, trail_low={tr.get('trail_low')}, trigger_atr={trigger_atr:.6f}, trigger_pct={trigger_pct:.6f}, armed={tr.get('trail_armed')}, atr={atr:.6f}")
+                        except Exception:
+                            pass
                         stop_triggered = price_now >= init_stop
                 except Exception:
                     trailing_triggered = False
@@ -2751,6 +2805,19 @@ def update(n, store):
     if tick % settings.dash_train_interval == 0:
         try:
             dfh = OHLCV.sync_fetch(active_symbol, settings.timeframes[0], settings.history_limit)
+            # cooldown guard to avoid frequent retrains (seconds)
+            try:
+                now_ts = time.time()
+                if last_retrain_ts is not None and (now_ts - last_retrain_ts) < getattr(settings, 'retrain_cooldown', 3600):
+                    # skip this retrain due to cooldown
+                    log.info("Skipping AE retrain due to cooldown")
+                    dfh = None
+                else:
+                    # will proceed; update last_retrain_ts after successful retrain
+                    pass
+            except Exception:
+                pass
+
             
             if dfh is not None and len(dfh) > 0:
                 schedule_retrain(dfh, settings.wnd_min, f"conv_ae_m{settings.wnd_min}.pth")
