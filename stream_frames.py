@@ -1,3 +1,57 @@
+#!/usr/bin/env python3
+# stream_frames.py
+"""
+Генерує кадри і шле їх в ffmpeg -> RTMP (YouTube primary + backup).
+Містить діагностичний render_frame() — логгування типу, md5, std і збереження кожного N-го кадру.
+"""
+
+import os
+import sys
+import time
+import subprocess
+import io
+import numpy as np
+from PIL import Image, ImageDraw
+
+# відео-параметри
+WIDTH = int(os.environ.get("STREAM_WIDTH", 640))
+HEIGHT = int(os.environ.get("STREAM_HEIGHT", 360))
+FPS = int(os.environ.get("STREAM_FPS", 15))
+BITRATE = os.environ.get("STREAM_BITRATE", "1200k")
+
+YT_KEY = os.environ.get("YT_KEY")
+YT_PRIMARY = os.environ.get("YT_PRIMARY", "rtmp://a.rtmp.youtube.com/live2")
+YT_BACKUP = os.environ.get("YT_BACKUP", "rtmp://b.rtmp.youtube.com/live2")
+
+if not YT_KEY:
+    print("ERROR: YT_KEY not set", file=sys.stderr)
+    sys.exit(1)
+
+# ffmpeg команда: stdin rawvideo -> two flv outputs
+ffmpeg_cmd = [
+    "ffmpeg",
+    "-hide_banner", "-loglevel", "info",
+    "-f", "rawvideo",
+    "-pix_fmt", "rgb24",
+    "-s", f"{WIDTH}x{HEIGHT}",
+    "-r", str(FPS),
+    "-i", "-",
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-b:v", BITRATE,
+    "-pix_fmt", "yuv420p",
+    "-g", str(FPS*2),
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-ar", "44100",
+    "-f", "flv", f"{YT_PRIMARY}/{YT_KEY}",
+    "-f", "flv", f"{YT_BACKUP}/{YT_KEY}?backup=1"
+]
+
+print("Starting ffmpeg:", " ".join(ffmpeg_cmd), file=sys.stderr)
+proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+
+# ---- diagnostic render_frame ----
 def render_frame(t_seconds, width=WIDTH, height=HEIGHT):
     """
     Diagnostic render:
@@ -10,7 +64,7 @@ def render_frame(t_seconds, width=WIDTH, height=HEIGHT):
     try:
         import io, sys, hashlib
         import plotly.io as pio
-        from PIL import Image, ImageStat
+        from PIL import Image, ImageStat, ImageDraw
         from live_stream_adapter import build_stream_figure
 
         # Передаємо t_seconds (дуже важливо для динаміки)
@@ -68,3 +122,26 @@ def render_frame(t_seconds, width=WIDTH, height=HEIGHT):
         except Exception:
             pass
         return arr
+# ---- end diagnostic render_frame ----
+
+try:
+    t0 = time.time()
+    frame_interval = 1.0 / FPS
+    while True:
+        t = time.time() - t0
+        frame = render_frame(t, WIDTH, HEIGHT)
+        if frame.shape != (HEIGHT, WIDTH, 3):
+            print("ERROR: unexpected frame shape:", frame.shape, file=sys.stderr)
+            break
+        proc.stdin.write(frame.tobytes())
+        proc.stdin.flush()
+        time.sleep(frame_interval)
+except KeyboardInterrupt:
+    print("KeyboardInterrupt — terminating ffmpeg", file=sys.stderr)
+finally:
+    try:
+        proc.stdin.close()
+    except Exception:
+        pass
+    proc.wait()
+    print("ffmpeg exited with code", proc.returncode, file=sys.stderr)
