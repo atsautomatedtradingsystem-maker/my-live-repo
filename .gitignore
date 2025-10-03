@@ -1,0 +1,6 @@
+stream.env
+.env
+.venv/
+__pycache__/
+frame_debug_*.png
+ffmpeg_run.log
