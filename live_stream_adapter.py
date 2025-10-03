@@ -1,34 +1,56 @@
 # live_stream_adapter.py
+"""
+Адаптер для stream_frames.py — намагається отримати plotly-фігуру з live.py
+Якщо import live або виклик update() провалюється — повертає None.
+stream_frames.py потім робить fallback render.
+"""
+
 def build_stream_figure(width=640, height=360):
+    """
+    ПОВИНЕН ПОВЕРТАТИ:
+      - plotly.graph_objs._figure.Figure  (оптимально)
+      або
+      - PIL.Image.Image
+      або
+      - None (тоді буде fallback).
+    Стратегія:
+      1) Спробувати імпортнути live і викликати його callback update(0, store)
+      2) Якщо немає update() — шукати helper build_stream_figure у live
+    """
     try:
+        # імпортуємо модуль live (може кидати ModuleNotFoundError якщо немає deps)
         import importlib
-        import plotly.graph_objects as go
-        live = None
-        try:
-            live = importlib.import_module("live")
-        except Exception:
-            live = None
+        live = importlib.import_module("live")
+    except Exception as e:
+        # лог в stderr, але не піднімаємо виняток
+        print("ADAPTER: import live failed:", e, file=sys.stderr if 'sys' in globals() else None)
+        return None
 
-        if live and hasattr(live, "build_stream_figure"):
+    try:
+        # 1) якщо у live є спеціальна функція build_stream_figure — викликнемо її
+        if hasattr(live, "build_stream_figure"):
             try:
-                return live.build_stream_figure(width=width, height=height)
-            except Exception:
-                pass
-
-        fig = go.Figure()
-        fig.update_layout(
-            width=width, height=height,
-            paper_bgcolor="#121212", plot_bgcolor="#121212",
-            margin=dict(l=8,r=8,t=24,b=8), font=dict(color="white")
-        )
-        import datetime
-        fig.add_annotation(text="Stream (adapter)", xref="paper", yref="paper",
-                           x=0.02, y=0.98, showarrow=False)
-        fig.add_annotation(text=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                           xref="paper", yref="paper", x=0.02, y=0.92, showarrow=False, font=dict(size=10))
-        x = list(range(10))
-        y = [ (i+1) * (1 + 0.1 * i) for i in x ]
-        fig.add_trace(go.Scatter(x=x, y=y, mode="lines+markers", marker=dict(size=6)))
-        return fig
-    except Exception:
+                fig = live.build_stream_figure(width=width, height=height)
+                return fig
+            except Exception as e:
+                print("ADAPTER: live.build_stream_figure() failed:", e)
+                # падіння — пробуємо далі
+        # 2) Інакше — намагаємось викликати основний callback update(n, store)
+        if hasattr(live, "update"):
+            try:
+                # передаємо простий store (можна змінити на потрібний вам)
+                store = getattr(live, "active_state", {}) or {}
+                res = live.update(0, store)
+                # update() за вашим кодом повертає (figure, children, store)
+                if isinstance(res, (list, tuple)) and len(res) >= 1:
+                    return res[0]
+                # якщо update повернув одне значення — повертаємо його
+                return res
+            except Exception as e:
+                print("ADAPTER: live.update() call failed:", e)
+                return None
+        # нічого не знайшли
+        return None
+    except Exception as e:
+        print("ADAPTER: unexpected error:", e)
         return None
