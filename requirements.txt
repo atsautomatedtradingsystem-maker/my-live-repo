@@ -1,0 +1,9 @@
+numpy
+pillow
+plotly
+kaleido
+dash
+dash-bootstrap-components
+pandas
+typer
+ccxt
